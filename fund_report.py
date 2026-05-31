@@ -5,10 +5,14 @@ import base64
 import smtplib
 import requests
 import pandas as pd
+from bs4 import BeautifulSoup
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+# 配置中文字体
+plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
 from io import BytesIO
 from datetime import datetime
 from email.mime.text import MIMEText
@@ -19,9 +23,9 @@ from email.mime.multipart import MIMEMultipart
 # 格式: {"code": "基金代码", "name": "基金名称"}
 # ============================================================
 FUND_LIST = [
-    {"code": "110011", "name": "易方达中小盘混合"},
-    {"code": "161725", "name": "招商中证白酒指数"},
-    {"code": "000961", "name": "天弘沪深300ETF联接A"},
+    {"code": "968168", "name": "百达策略收益M人民币"},
+    {"code": "968075", "name": "百达策略收益人民币"},
+    {"code": "377240", "name": "摩根新兴动力混合A类"},
 ]
 
 # 邮件配置（从环境变量读取，本地测试可直接填写）
@@ -40,18 +44,17 @@ def fetch_fund_realtime(code: str) -> dict:
         # 响应格式: jsonpgz({...});
         match = re.search(r"jsonpgz\((\{.*?\})\)", resp.text)
         if match:
-            return json.loads(match.group(1))
+            data = json.loads(match.group(1))
+            if data:  # 确保返回的数据不为空
+                return data
     except Exception as e:
         print(f"[WARN] 获取实时估值失败 {code}: {e}")
     return {}
 
 
 def fetch_fund_history(code: str, days: int = 30) -> pd.DataFrame:
-    """获取基金历史净值（天天基金网）"""
-    url = (
-        f"https://api.fund.eastmoney.com/f10/lsjz"
-        f"?fundCode={code}&page=1&per={days}&type=1"
-    )
+    """获取基金历史净值（天天基金网 HTML 接口）"""
+    url = f"https://fundf10.eastmoney.com/F10DataApi.aspx?type=lsjz&code={code}&page=1&per={days}"
     headers = {
         "Referer": "https://fund.eastmoney.com/",
         "User-Agent": "Mozilla/5.0",
@@ -59,12 +62,26 @@ def fetch_fund_history(code: str, days: int = 30) -> pd.DataFrame:
     try:
         resp = requests.get(url, headers=headers, timeout=10)
         resp.raise_for_status()
-        data = resp.json()
-        records = data.get("Data", {}).get("LSJZList", [])
+        # 响应格式: var apidata={ content:"<table>...</table>", ... }
+        match = re.search(r'content:"(.*?)",records:', resp.text, re.DOTALL)
+        if not match:
+            print(f"[WARN] 历史净值解析失败 {code}: 未找到 content 字段")
+            return pd.DataFrame()
+        html_table = match.group(1).replace('\\"', '"')
+        soup = BeautifulSoup(html_table, "html.parser")
+        rows = soup.select("tbody tr")
+        records = []
+        for row in rows:
+            cols = [td.get_text(strip=True) for td in row.find_all("td")]
+            if len(cols) >= 4:
+                records.append({
+                    "date":       cols[0],
+                    "nav":        cols[1],
+                    "change_pct": cols[3].replace("%", ""),
+                })
         if not records:
             return pd.DataFrame()
         df = pd.DataFrame(records)
-        df = df.rename(columns={"FSRQ": "date", "DWJZ": "nav", "JZZZL": "change_pct"})
         df["date"] = pd.to_datetime(df["date"])
         df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
         df["change_pct"] = pd.to_numeric(df["change_pct"], errors="coerce")
@@ -153,6 +170,8 @@ def build_html_email(funds_data: list) -> str:
         chart_b64 = fd.get("chart", "")
 
         # 实时估值字段
+        dwjz  = rt.get("dwjz", "—")   # 单位净值（最新公布）
+        jzrq  = rt.get("jzrq", "")    # 净值日期
         gsz   = rt.get("gsz", "—")    # 估算净值
         gszzl = rt.get("gszzl", "—")  # 估算涨跌幅
         gztime = rt.get("gztime", "")
@@ -172,6 +191,7 @@ def build_html_email(funds_data: list) -> str:
         <tr>
           <td>{name}</td>
           <td>{code}</td>
+          <td><strong>{dwjz}</strong><br/><span style="font-size:11px;color:#999">{jzrq}</span></td>
           <td><strong>{gsz}</strong></td>
           <td>{gszzl_str}</td>
           <td>{ret_1w}</td>
@@ -211,7 +231,7 @@ def build_html_email(funds_data: list) -> str:
   <table>
     <thead>
       <tr>
-        <th>基金名称</th><th>代码</th><th>估算净值</th><th>今日涨跌</th>
+        <th>基金名称</th><th>代码</th><th>单位净值</th><th>估算净值</th><th>今日涨跌</th>
         <th>近1周</th><th>近1月</th><th>近3月</th><th>投资建议</th>
       </tr>
     </thead>
@@ -260,6 +280,21 @@ def main():
 
         realtime = fetch_fund_realtime(code)
         history  = fetch_fund_history(code, days=90)  # 多取一些用于3月收益计算
+
+        # 如果实时API返回空（海外基金等），用历史数据填充
+        if not realtime and not history.empty:
+            print(f"[INFO] 实时数据为空，使用历史数据填充 {code}")
+            latest = history.iloc[-1]
+            realtime = {
+                "fundcode": code,
+                "name": name,
+                "dwjz": str(latest["nav"]),
+                "jzrq": latest["date"].strftime("%Y-%m-%d"),
+                "gsz": str(latest["nav"]),
+                "gszzl": str(latest["change_pct"]) if pd.notna(latest["change_pct"]) else "0",
+                "gztime": latest["date"].strftime("%Y-%m-%d"),
+            }
+
         advice   = generate_advice(history)
 
         chart_b64 = ""

@@ -50,6 +50,17 @@ FUND_LIST = [
 
 ## 本地测试
 
+### 方式一：生成 HTML 预览（推荐，无需邮箱配置）
+
+```bash
+pip install -r requirements.txt
+python test_local.py
+```
+
+会生成 `preview.html` 文件，用浏览器打开查看邮件效果。
+
+### 方式二：实际发送邮件测试
+
 ```bash
 pip install -r requirements.txt
 
