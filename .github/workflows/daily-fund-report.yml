@@ -1,0 +1,30 @@
+name: Daily Fund Report
+
+on:
+  schedule:
+    # 每个工作日北京时间 15:05 触发（UTC 07:05）
+    - cron: '5 7 * * 1-5'
+  workflow_dispatch:  # 支持手动触发
+
+jobs:
+  send-report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run fund report
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          EMAIL_TO:   ${{ secrets.EMAIL_TO }}
+        run: python fund_report.py
